@@ -252,6 +252,9 @@ def inject_referral(url: str, referral_append_url: str) -> str:
 
 # ─── Global state ─────────────────────────────────────────────────────────────
 
+_MAX_EVENT_LOG = 20  # keep the last N events in memory
+
+
 class BotState:
     def __init__(self):
         self.running: bool = False
@@ -265,6 +268,18 @@ class BotState:
         self.conv_step: dict[int, dict] = {}
         # Handle to the running automation task (for cancellation)
         self.loop_task: Optional[asyncio.Task] = None
+        # Rolling in-memory event log (newest first)
+        self.event_log: list[str] = []
+
+    def record_event(self, text: str) -> None:
+        """Prepend a timestamped entry and keep only the last _MAX_EVENT_LOG items."""
+        ts = datetime.now().strftime("%H:%M:%S")
+        # Use the first line of the message as the log summary
+        summary = text.splitlines()[0] if text else ""
+        entry = f"[{ts}] {summary}"
+        self.event_log.insert(0, entry)
+        if len(self.event_log) > _MAX_EVENT_LOG:
+            self.event_log = self.event_log[:_MAX_EVENT_LOG]
 
 
 state = BotState()
@@ -597,6 +612,7 @@ async def automation_loop(control_client: TelegramClient, cfg: dict) -> None:
     owner_id = cfg["your_personal_telegram_id"]
 
     async def notify(text: str) -> None:
+        state.record_event(text)          # always log, even if Telegram send fails
         try:
             await control_client.send_message(owner_id, text)
         except Exception as ne:
@@ -656,6 +672,7 @@ _KEYBOARD_ROWS = [
     ["📊 تقرير الدورة الحالية", "🌐 فحص الـ IP الحالي"],
     ["➕ إضافة رابط/بوت جديد", "📋 عرض المهام"],
     ["🗑️ حذف مهمة", "📅 إعادة تعيين الإحصائيات"],
+    ["📝 سجل الأحداث"],
 ]
 
 
@@ -901,6 +918,23 @@ async def start_control_bot(cfg: dict) -> None:
                 f"  Cycles : {old_cycles} → 0\n\n"
                 f"Reset at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             )
+
+        elif text == "📝 سجل الأحداث":
+            if not state.event_log:
+                await send(
+                    "📝 Event Log\n"
+                    "──────────────────────\n"
+                    "No events recorded yet.\n"
+                    "Start the automation with 🚀 to begin logging."
+                )
+                return
+            lines = [
+                f"📝 Event Log — last {len(state.event_log)} events\n"
+                f"{'─' * 22}"
+            ]
+            lines.extend(state.event_log)
+            lines.append(f"{'─' * 22}\nShowing newest → oldest")
+            await send("\n".join(lines))
 
         else:
             # Unknown text while not in wizard — silently ignore
