@@ -91,13 +91,26 @@ def load_config() -> dict:
             log.error("Config '%s' cast error: %s", env_key, exc)
             return None
 
+    # proxy_host may arrive as "host:port" — split it so callers always get a
+    # clean hostname.  PROXY_PORT still wins if set explicitly.
+    raw_proxy_host = _get("PROXY_HOST", "proxy_host", required=False) or ""
+    if ":" in raw_proxy_host:
+        _ph_parts = raw_proxy_host.rsplit(":", 1)
+        _proxy_host_clean = _ph_parts[0]
+        _proxy_port_from_host = int(_ph_parts[1]) if _ph_parts[1].isdigit() else 443
+    else:
+        _proxy_host_clean = raw_proxy_host
+        _proxy_port_from_host = 443
+
+    _explicit_port = _get("PROXY_PORT", "proxy_port", int, required=False)
+
     cfg = {
         "api_id":                   _get("API_ID",               "api_id",                   int),
         "api_hash":                  _get("API_HASH",              "api_hash"),
         "control_bot_token":         _get("CONTROL_BOT_TOKEN",     "control_bot_token"),
         "your_personal_telegram_id": _get("PERSONAL_TELEGRAM_ID", "your_personal_telegram_id", int),
-        "proxy_host":                _get("PROXY_HOST",            "proxy_host",               required=False) or "",
-        "proxy_port":                _get("PROXY_PORT",            "proxy_port",               int, required=False) or 443,
+        "proxy_host":                _proxy_host_clean,
+        "proxy_port":                _explicit_port if _explicit_port else _proxy_port_from_host,
         "proxy_username":            _get("PROXY_USERNAME",        "proxy_username",           required=False) or "",
         "proxy_password":            _get("PROXY_PASSWORD",        "proxy_password",           required=False) or "",
     }
