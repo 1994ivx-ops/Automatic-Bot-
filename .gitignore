@@ -64,3 +64,17 @@ __pycache__/
 
 # Playwright browser binaries
 .cache/ms-playwright/
+
+# Telethon session files (also at root after flat restructure)
+*.session
+*.session-journal
+
+# Persistent event log written by the bot at runtime
+events.log
+events.log.tmp
+
+# Local dev secrets
+config.json
+secrets.env
+.env
+.env.*

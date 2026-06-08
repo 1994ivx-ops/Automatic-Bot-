@@ -1,0 +1,6 @@
+telethon
+python-socks
+PySocks
+playwright
+requests
+flask
