@@ -1,0 +1,5 @@
+telethon
+python-socks
+playwright
+requests
+flask

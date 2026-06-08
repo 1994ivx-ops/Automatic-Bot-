@@ -1,0 +1,9 @@
+{
+  "tasks": [
+    {
+      "bot_username": "@YourTargetBot",
+      "buttons": ["Watch Video", "Open Link", "Claim"],
+      "referral_append_url": ""
+    }
+  ]
+}
