@@ -152,29 +152,21 @@ def save_targets(data: dict) -> None:
 
 # ─── Proxy helpers ────────────────────────────────────────────────────────────
 
-def fresh_session_suffix() -> str:
-    """
-    Returns a unique suffix injected into the proxy username per-cycle.
-    Every call produces a different random integer, guaranteeing IP rotation.
-    """
-    return f"-session_{random.randint(100000, 999999)}"
-
-
-def build_telethon_proxy(cfg: dict, suffix: str) -> dict:
+def build_telethon_proxy(cfg: dict) -> dict:
     """SOCKS5 proxy dict accepted by Telethon's `proxy=` parameter."""
     return {
         "proxy_type": "socks5",
         "addr": cfg["proxy_host"],
         "port": int(cfg["proxy_port"]),
-        "username": cfg["proxy_username"] + suffix,
+        "username": cfg["proxy_username"],
         "password": cfg["proxy_password"],
         "rdns": True,
     }
 
 
-def build_requests_proxy(cfg: dict, suffix: str) -> dict:
+def build_requests_proxy(cfg: dict) -> dict:
     """Proxy dict accepted by the `requests` library."""
-    user = cfg["proxy_username"] + suffix
+    user = cfg["proxy_username"]
     url = (
         f"socks5h://{user}:{cfg['proxy_password']}"
         f"@{cfg['proxy_host']}:{cfg['proxy_port']}"
@@ -182,16 +174,16 @@ def build_requests_proxy(cfg: dict, suffix: str) -> dict:
     return {"http": url, "https": url}
 
 
-def build_playwright_proxy(cfg: dict, suffix: str) -> dict:
+def build_playwright_proxy(cfg: dict) -> dict:
     """Proxy dict accepted by Playwright's `browser.launch(proxy=...)`."""
     return {
         "server": f"socks5://{cfg['proxy_host']}:{cfg['proxy_port']}",
-        "username": cfg["proxy_username"] + suffix,
+        "username": cfg["proxy_username"],
         "password": cfg["proxy_password"],
     }
 
 
-async def get_current_ip_async(cfg: dict, suffix: str) -> str:
+async def get_current_ip_async(cfg: dict) -> str:
     """
     Non-blocking IP lookup through the session proxy.
     Runs the blocking `requests.get` in a thread pool so it never stalls
@@ -199,7 +191,7 @@ async def get_current_ip_async(cfg: dict, suffix: str) -> str:
     """
     def _fetch():
         try:
-            proxies = build_requests_proxy(cfg, suffix)
+            proxies = build_requests_proxy(cfg)
             r = requests.get(
                 "https://api.ipify.org?format=json", proxies=proxies, timeout=15
             )
@@ -483,15 +475,15 @@ async def playwright_visit(url: str, playwright_proxy: dict) -> bool:
 
 # ─── Userbot cycle (single pass over all tasks) ───────────────────────────────
 
-async def run_userbot_cycle(cfg: dict, suffix: str, notify) -> None:
+async def run_userbot_cycle(cfg: dict, notify) -> None:
     """
-    Connects the Telethon userbot via a fresh proxy session, iterates every
+    Connects the Telethon userbot via the configured proxy, iterates every
     task in targets.json sequentially, clicks matching buttons, injects
     referral tokens, and launches the Playwright visit for each extracted URL.
     Always disconnects on exit, even if an exception occurs.
     """
-    proxy = build_telethon_proxy(cfg, suffix)
-    playwright_proxy = build_playwright_proxy(cfg, suffix)
+    proxy = build_telethon_proxy(cfg)
+    playwright_proxy = build_playwright_proxy(cfg)
 
     client = TelegramClient(
         os.path.join(BASE_DIR, "userbot_session"),
@@ -665,10 +657,8 @@ async def automation_loop(control_client: TelegramClient, cfg: dict) -> None:
     try:
         while state.running and not state.paused:
             # Fresh session token = fresh IP for every cycle
-            suffix = fresh_session_suffix()
-
             # IP lookup is blocking — run in thread pool
-            state.active_ip = await get_current_ip_async(cfg, suffix)
+            state.active_ip = await get_current_ip_async(cfg)
 
             log.info("═══ Cycle start | IP: %s ═══", state.active_ip)
             await notify(
@@ -677,7 +667,7 @@ async def automation_loop(control_client: TelegramClient, cfg: dict) -> None:
                 f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             )
 
-            await run_userbot_cycle(cfg, suffix, notify)
+            await run_userbot_cycle(cfg, notify)
 
             if not state.running or state.paused:
                 break
@@ -898,10 +888,9 @@ async def start_control_bot(cfg: dict) -> None:
 
         elif text == "🌐 فحص الـ IP الحالي":
             await send("🔍 Checking IP via session proxy…")
-            suffix = fresh_session_suffix()
-            ip = await get_current_ip_async(cfg, suffix)
+            ip = await get_current_ip_async(cfg)
             state.active_ip = ip
-            await send(f"🌐 Current IP: {ip}\nSession: …{suffix[-10:]}")
+            await send(f"🌐 Current IP: {ip}")
 
         elif text == "➕ إضافة رابط/بوت جديد":
             state.conv_step[owner_id] = {"step": "ask_username"}
@@ -1056,7 +1045,7 @@ async def first_time_auth(cfg: dict) -> None:
     The session is saved to userbot_session.session and never needs to be
     repeated unless the session is revoked.
     """
-    proxy = build_telethon_proxy(cfg, fresh_session_suffix())
+    proxy = build_telethon_proxy(cfg)
     client = TelegramClient(
         os.path.join(BASE_DIR, "userbot_session"),
         cfg["api_id"],
