@@ -603,7 +603,7 @@ async def automation_loop(control_client: TelegramClient, cfg: dict) -> None:
 _KEYBOARD_ROWS = [
     ["🚀 تشغيل السكربت", "🛑 إيقاف مؤقت"],
     ["📊 تقرير الدورة الحالية", "🌐 فحص الـ IP الحالي"],
-    ["➕ إضافة رابط/بوت جديد"],
+    ["➕ إضافة رابط/بوت جديد", "📋 عرض المهام"],
 ]
 
 
@@ -758,6 +758,26 @@ async def start_control_bot(cfg: dict) -> None:
                 "➕ New Task Wizard — Step 1/3\n\n"
                 "Send the bot username (e.g. @EarnBot):"
             )
+
+        elif text == "📋 عرض المهام":
+            targets = load_targets()
+            tasks = targets.get("tasks", [])
+            if not tasks:
+                await send("📋 No tasks configured yet.\nUse ➕ to add your first bot.")
+                return
+
+            lines = [f"📋 Task List ({len(tasks)} total)\n{'─' * 22}"]
+            for i, t in enumerate(tasks, start=1):
+                username = t.get("bot_username", "(no username)")
+                buttons = ", ".join(t.get("buttons", [])) or "(none)"
+                referral = t.get("referral_append_url", "") or "(none)"
+                lines.append(
+                    f"\n#{i} — {username}\n"
+                    f"  Buttons : {buttons}\n"
+                    f"  Referral: {referral}"
+                )
+            lines.append(f"\n{'─' * 22}\nEdit targets.json to remove or reorder tasks.")
+            await send("\n".join(lines))
 
         else:
             # Unknown text while not in wizard — silently ignore
