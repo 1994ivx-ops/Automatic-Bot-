@@ -5,10 +5,15 @@ Dual-bot Telegram + Browser automation system.
   - Control Bot:  Telegram bot (token-based) for the owner to start/stop/monitor.
   - Flask:        Lightweight health server for Railway port-binding.
 
-Run once for first-time auth:
+First-time auth (run locally — requires an interactive terminal):
     python main.py auth
 
-Normal run:
+    This prompts for phone → OTP → 2FA, saves a local session file, AND
+    prints a SESSION_STRING value.  Set that value as the SESSION_STRING
+    environment variable on Railway so the session survives redeployments.
+    See replit.md for the full step-by-step guide.
+
+Normal run (Railway uses this via Procfile):
     python main.py
 """
 
@@ -27,6 +32,7 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import requests
 from flask import Flask
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 from telethon.tl.types import (
     ReplyInlineMarkup,
     KeyboardButtonUrl,
@@ -164,6 +170,29 @@ def save_targets(data: dict) -> None:
             raise
 
 # ─── Proxy helpers ────────────────────────────────────────────────────────────
+
+def _get_userbot_session():
+    """
+    Returns the Telethon session argument for the userbot client.
+
+    - If SESSION_STRING env var is set, uses StringSession (Railway / any
+      cloud platform with ephemeral filesystems).
+    - Otherwise falls back to the local session file (for local dev after
+      running `python main.py auth`).
+
+    To generate SESSION_STRING:
+        1. Run `python main.py auth` locally with all env vars set.
+        2. Copy the session string that is printed at the end.
+        3. Set SESSION_STRING=<that string> in your Railway env vars.
+    """
+    session_string = os.environ.get("SESSION_STRING", "").strip()
+    if session_string:
+        log.info("Userbot: using StringSession from SESSION_STRING env var.")
+        return StringSession(session_string)
+    session_file = os.path.join(BASE_DIR, "userbot_session")
+    log.info("Userbot: using file-based session at %s", session_file)
+    return session_file
+
 
 def build_telethon_proxy(cfg: dict) -> dict:
     """SOCKS5 proxy dict accepted by Telethon's `proxy=` parameter."""
@@ -499,7 +528,7 @@ async def run_userbot_cycle(cfg: dict, notify) -> None:
     playwright_proxy = build_playwright_proxy(cfg)
 
     client = TelegramClient(
-        os.path.join(BASE_DIR, "userbot_session"),
+        _get_userbot_session(),
         cfg["api_id"],
         cfg["api_hash"],
         proxy=proxy,
@@ -509,10 +538,16 @@ async def run_userbot_cycle(cfg: dict, notify) -> None:
         await client.connect()
 
         if not await client.is_user_authorized():
-            log.error("Userbot session is not authorised. Run: python main.py auth")
+            log.error(
+                "Userbot session is not authorised. "
+                "Run 'python main.py auth' locally and set SESSION_STRING on Railway."
+            )
             await notify(
-                "⚠️ Userbot session not authorised.\n"
-                "SSH into the server and run:\n`python main.py auth`"
+                "⚠️ Userbot session not authorised.\n\n"
+                "Run this locally to generate a session string:\n"
+                "`python main.py auth`\n\n"
+                "Then set the printed value as the\n"
+                "`SESSION_STRING` environment variable on Railway."
             )
             return
 
@@ -1077,22 +1112,53 @@ def start_flask() -> None:
 
 async def first_time_auth(cfg: dict) -> None:
     """
-    Interactive one-time flow to create and save the userbot session file.
+    Interactive one-time flow to authorise the userbot and generate a session.
+
     Telethon will prompt for phone number → OTP → (optional) 2FA password.
-    The session is saved to userbot_session.session and never needs to be
-    repeated unless the session is revoked.
+    Two artefacts are produced:
+      1. userbot_session.session  — local file (works for local dev)
+      2. SESSION_STRING           — printed to stdout; set this as a Railway
+                                    environment variable so the session survives
+                                    across deployments on ephemeral filesystems.
+
+    This command only needs to be run once (or whenever the session is revoked).
     """
     proxy = build_telethon_proxy(cfg)
+
+    # Always use a file-based session for auth so the interactive prompt works
+    # reliably and the .session file is available for local dev too.
+    session_path = os.path.join(BASE_DIR, "userbot_session")
     client = TelegramClient(
-        os.path.join(BASE_DIR, "userbot_session"),
+        session_path,
         cfg["api_id"],
         cfg["api_hash"],
         proxy=proxy,
     )
     await client.start()
     me = await client.get_me()
-    print(f"\n✅ Authorised as: {me.first_name} (@{me.username}) — session saved.\n")
+
+    # Export as a portable string (needed for Railway / any cloud platform)
+    session_string = client.session.save()
+
     await client.disconnect()
+
+    print(f"\n✅ Authorised as: {me.first_name} (@{me.username})")
+    print(f"   Local session file saved to: {session_path}.session\n")
+    print("━" * 64)
+    print("  SESSION STRING — copy this for Railway / cloud deployment")
+    print("━" * 64)
+    print()
+    print(session_string)
+    print()
+    print("━" * 64)
+    print("  NEXT STEPS:")
+    print("  1. Copy the string printed above (the long base64-ish value).")
+    print("  2. In your Railway project → Variables, add:")
+    print("       SESSION_STRING = <paste here>")
+    print("  3. Redeploy / restart the Railway service.")
+    print("  4. The Control Bot will message you on Telegram once it's live.")
+    print("━" * 64)
+    print()
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
