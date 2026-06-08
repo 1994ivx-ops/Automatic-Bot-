@@ -604,6 +604,7 @@ _KEYBOARD_ROWS = [
     ["🚀 تشغيل السكربت", "🛑 إيقاف مؤقت"],
     ["📊 تقرير الدورة الحالية", "🌐 فحص الـ IP الحالي"],
     ["➕ إضافة رابط/بوت جديد", "📋 عرض المهام"],
+    ["🗑️ حذف مهمة"],
 ]
 
 
@@ -688,6 +689,44 @@ async def start_control_bot(cfg: dict) -> None:
                     f"Buttons: {', '.join(new_task['buttons'])}\n"
                     f"Referral: {referral or '(none)'}\n\n"
                     f"Total tasks: {len(data['tasks'])}"
+                )
+                return
+
+            if step == "ask_delete_number":
+                data = load_targets()
+                tasks = data.get("tasks", [])
+                total = len(tasks)
+
+                # Allow "cancel" to abort
+                if text.lower() in ("cancel", "إلغاء", "0"):
+                    del state.conv_step[owner_id]
+                    await send("↩️ Delete cancelled. No changes made.")
+                    return
+
+                try:
+                    idx = int(text)
+                except ValueError:
+                    await event.reply(
+                        f"⚠️ Please send a number between 1 and {total}, "
+                        f"or type `cancel` to abort:"
+                    )
+                    return
+
+                if idx < 1 or idx > total:
+                    await event.reply(
+                        f"⚠️ Number out of range (1–{total}). Try again or type `cancel`:"
+                    )
+                    return
+
+                removed = tasks.pop(idx - 1)
+                data["tasks"] = tasks
+                save_targets(data)
+                del state.conv_step[owner_id]
+
+                await send(
+                    f"🗑️ Task #{idx} deleted!\n"
+                    f"Removed: {removed.get('bot_username', '?')}\n\n"
+                    f"Remaining tasks: {len(tasks)}"
                 )
                 return
 
@@ -776,8 +815,23 @@ async def start_control_bot(cfg: dict) -> None:
                     f"  Buttons : {buttons}\n"
                     f"  Referral: {referral}"
                 )
-            lines.append(f"\n{'─' * 22}\nEdit targets.json to remove or reorder tasks.")
+            lines.append(f"\n{'─' * 22}\nUse 🗑️ to delete a task by number.")
             await send("\n".join(lines))
+
+        elif text == "🗑️ حذف مهمة":
+            data = load_targets()
+            tasks = data.get("tasks", [])
+            if not tasks:
+                await send("📋 No tasks to delete. Add one first with ➕.")
+                return
+
+            # Build a numbered preview so the user knows which number to send
+            lines = [f"🗑️ Delete Task\n{'─' * 22}\nWhich task do you want to delete?\n"]
+            for i, t in enumerate(tasks, start=1):
+                lines.append(f"  #{i} — {t.get('bot_username', '?')}")
+            lines.append(f"\n{'─' * 22}\nSend the task number (1–{len(tasks)})\nor type `cancel` to abort.")
+            state.conv_step[owner_id] = {"step": "ask_delete_number"}
+            await event.reply("\n".join(lines))
 
         else:
             # Unknown text while not in wizard — silently ignore
