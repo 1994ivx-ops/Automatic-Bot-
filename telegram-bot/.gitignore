@@ -1,8 +1,16 @@
-# Telethon session files — contain your auth tokens, never commit these
+# Telethon session files — contain auth tokens, NEVER commit
 *.session
 *.session-journal
 
-# Temp files written by atomic save
+# Local secrets file
+secrets.env
+.env
+.env.*
+
+# Replit config
+.replit
+
+# Atomic-write temp files
 .targets_tmp_*.json
 
 # Python
@@ -12,13 +20,10 @@ __pycache__/
 .eggs/
 *.egg-info/
 
-# Playwright browser binaries (large, installed at runtime)
+# Playwright browser binaries (downloaded at runtime)
 .local-chromium/
 ms-playwright/
-
-# Environment
-.env
-.env.*
+.cache/
 
 # Logs
 *.log

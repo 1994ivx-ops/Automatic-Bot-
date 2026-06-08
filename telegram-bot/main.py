@@ -58,8 +58,59 @@ _targets_lock = threading.Lock()
 # ─── Config / Targets helpers ─────────────────────────────────────────────────
 
 def load_config() -> dict:
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+    """
+    Builds the config dict from environment variables (Railway / production).
+    Falls back to config.json values for local development.
+    Environment variables always win — they are never overridden by the file.
+
+    Required env vars:
+        API_ID, API_HASH, CONTROL_BOT_TOKEN, PERSONAL_TELEGRAM_ID,
+        PROXY_HOST, PROXY_PORT, PROXY_USERNAME, PROXY_PASSWORD
+    """
+    # Try to load config.json as a local-dev fallback (values are placeholders in prod)
+    file_cfg: dict = {}
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        # Skip placeholder strings that start with "${"
+        file_cfg = {k: v for k, v in raw.items() if not str(v).startswith("${")}
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+    def _get(env_key: str, file_key: str, cast=str, required: bool = True):
+        val = os.environ.get(env_key) or file_cfg.get(file_key)
+        if not val:
+            if required:
+                log.error(
+                    "Missing required config: set the '%s' environment variable.", env_key
+                )
+            return None
+        try:
+            return cast(val)
+        except (ValueError, TypeError) as exc:
+            log.error("Config '%s' cast error: %s", env_key, exc)
+            return None
+
+    cfg = {
+        "api_id":                   _get("API_ID",               "api_id",                   int),
+        "api_hash":                  _get("API_HASH",              "api_hash"),
+        "control_bot_token":         _get("CONTROL_BOT_TOKEN",     "control_bot_token"),
+        "your_personal_telegram_id": _get("PERSONAL_TELEGRAM_ID", "your_personal_telegram_id", int),
+        "proxy_host":                _get("PROXY_HOST",            "proxy_host",               required=False) or "",
+        "proxy_port":                _get("PROXY_PORT",            "proxy_port",               int, required=False) or 443,
+        "proxy_username":            _get("PROXY_USERNAME",        "proxy_username",           required=False) or "",
+        "proxy_password":            _get("PROXY_PASSWORD",        "proxy_password",           required=False) or "",
+    }
+
+    # Surface any fatal misconfigurations immediately at startup
+    fatal = [k for k, v in cfg.items() if v is None]
+    if fatal:
+        raise RuntimeError(
+            f"Cannot start — missing required environment variables: "
+            + ", ".join(fatal)
+        )
+
+    return cfg
 
 
 def load_targets() -> dict:
