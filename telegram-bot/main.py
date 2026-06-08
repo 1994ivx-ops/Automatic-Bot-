@@ -604,7 +604,7 @@ _KEYBOARD_ROWS = [
     ["🚀 تشغيل السكربت", "🛑 إيقاف مؤقت"],
     ["📊 تقرير الدورة الحالية", "🌐 فحص الـ IP الحالي"],
     ["➕ إضافة رابط/بوت جديد", "📋 عرض المهام"],
-    ["🗑️ حذف مهمة"],
+    ["🗑️ حذف مهمة", "📅 إعادة تعيين الإحصائيات"],
 ]
 
 
@@ -832,6 +832,24 @@ async def start_control_bot(cfg: dict) -> None:
             lines.append(f"\n{'─' * 22}\nSend the task number (1–{len(tasks)})\nor type `cancel` to abort.")
             state.conv_step[owner_id] = {"step": "ask_delete_number"}
             await event.reply("\n".join(lines))
+
+        elif text == "📅 إعادة تعيين الإحصائيات":
+            old_clicks = state.total_clicks
+            old_links = state.links_today
+            old_cycles = state.cycles_today
+            state.total_clicks = 0
+            state.links_today = 0
+            state.cycles_today = 0
+            state.last_cycle_time = None
+            await send(
+                f"📅 Statistics reset!\n"
+                f"{'─' * 22}\n"
+                f"Cleared:\n"
+                f"  Clicks : {old_clicks} → 0\n"
+                f"  Links  : {old_links} → 0\n"
+                f"  Cycles : {old_cycles} → 0\n\n"
+                f"Reset at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
 
         else:
             # Unknown text while not in wizard — silently ignore
