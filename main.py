@@ -1038,6 +1038,30 @@ def health_check():
     )
 
 
+@flask_app.route("/status")
+def status_webhook():
+    import json as _json
+    from datetime import datetime as _dt
+
+    payload = {
+        "status": "running" if state.running else ("paused" if state.paused else "stopped"),
+        "running": state.running,
+        "paused": state.paused,
+        "proxy_ip": state.active_ip,
+        "total_clicks": state.total_clicks,
+        "links_today": state.links_today,
+        "cycles_today": state.cycles_today,
+        "last_cycle": state.last_cycle_time,
+        "timestamp": _dt.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "recent_events": state.event_log[:5],
+    }
+    return flask_app.response_class(
+        response=_json.dumps(payload, ensure_ascii=False, indent=2),
+        status=200,
+        mimetype="application/json",
+    )
+
+
 def start_flask() -> None:
     port = int(os.environ.get("PORT", 8080))
     log.info("Flask health server listening on 0.0.0.0:%d", port)
