@@ -252,7 +252,9 @@ def inject_referral(url: str, referral_append_url: str) -> str:
 
 # ─── Global state ─────────────────────────────────────────────────────────────
 
-_MAX_EVENT_LOG = 20  # keep the last N events in memory
+_MAX_EVENT_LOG   = 20    # entries kept in memory (newest first)
+_EVENT_LOG_FILE  = "events.log"   # path relative to CWD (telegram-bot/)
+_EVENT_LOG_DISK  = 500  # max lines kept on disk before rotation
 
 
 class BotState:
@@ -270,16 +272,58 @@ class BotState:
         self.loop_task: Optional[asyncio.Task] = None
         # Rolling in-memory event log (newest first)
         self.event_log: list[str] = []
+        # Seed in-memory log from disk so history survives restarts
+        self._load_event_log()
+
+    # ── disk helpers ──────────────────────────────────────────────────────────
+
+    def _load_event_log(self) -> None:
+        """Read the last _MAX_EVENT_LOG lines from events.log (newest first)."""
+        try:
+            with open(_EVENT_LOG_FILE, "r", encoding="utf-8") as fh:
+                lines = [ln.rstrip("\n") for ln in fh if ln.strip()]
+            # File is written oldest→newest; reverse for in-memory order
+            self.event_log = lines[-_MAX_EVENT_LOG:][::-1]
+        except FileNotFoundError:
+            pass  # first run — no log yet, that's fine
+        except Exception as exc:
+            log.warning("Could not load %s: %s", _EVENT_LOG_FILE, exc)
+
+    def _append_to_disk(self, entry: str) -> None:
+        """Append one line to events.log and rotate if the file exceeds _EVENT_LOG_DISK lines."""
+        try:
+            # Append the new line
+            with open(_EVENT_LOG_FILE, "a", encoding="utf-8") as fh:
+                fh.write(entry + "\n")
+
+            # Rotate: keep only the newest _EVENT_LOG_DISK lines
+            with open(_EVENT_LOG_FILE, "r", encoding="utf-8") as fh:
+                all_lines = fh.readlines()
+
+            if len(all_lines) > _EVENT_LOG_DISK:
+                keep = all_lines[-_EVENT_LOG_DISK:]
+                # Atomic write via temp file so a crash mid-write doesn't corrupt the log
+                tmp = _EVENT_LOG_FILE + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    fh.writelines(keep)
+                import shutil as _shutil
+                _shutil.move(tmp, _EVENT_LOG_FILE)
+        except Exception as exc:
+            log.warning("Could not write to %s: %s", _EVENT_LOG_FILE, exc)
+
+    # ── public API ────────────────────────────────────────────────────────────
 
     def record_event(self, text: str) -> None:
-        """Prepend a timestamped entry and keep only the last _MAX_EVENT_LOG items."""
-        ts = datetime.now().strftime("%H:%M:%S")
-        # Use the first line of the message as the log summary
+        """Record a timestamped event in memory and persist it to disk."""
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         summary = text.splitlines()[0] if text else ""
         entry = f"[{ts}] {summary}"
+        # Memory (newest first, capped at _MAX_EVENT_LOG)
         self.event_log.insert(0, entry)
         if len(self.event_log) > _MAX_EVENT_LOG:
             self.event_log = self.event_log[:_MAX_EVENT_LOG]
+        # Disk (oldest first, rotated at _EVENT_LOG_DISK)
+        self._append_to_disk(entry)
 
 
 state = BotState()
@@ -920,7 +964,23 @@ async def start_control_bot(cfg: dict) -> None:
             )
 
         elif text == "📝 سجل الأحداث":
-            if not state.event_log:
+            # Prefer in-memory log (fast); fall back to reading from disk
+            # so history is available immediately after a restart.
+            display = list(state.event_log)  # already newest-first
+            source = "memory"
+
+            if not display:
+                try:
+                    with open(_EVENT_LOG_FILE, "r", encoding="utf-8") as fh:
+                        disk_lines = [ln.rstrip("\n") for ln in fh if ln.strip()]
+                    display = disk_lines[-_MAX_EVENT_LOG:][::-1]  # newest first
+                    source = "disk"
+                except FileNotFoundError:
+                    pass
+                except Exception as exc:
+                    log.warning("Event log read error: %s", exc)
+
+            if not display:
                 await send(
                     "📝 Event Log\n"
                     "──────────────────────\n"
@@ -928,13 +988,18 @@ async def start_control_bot(cfg: dict) -> None:
                     "Start the automation with 🚀 to begin logging."
                 )
                 return
-            lines = [
-                f"📝 Event Log — last {len(state.event_log)} events\n"
-                f"{'─' * 22}"
-            ]
-            lines.extend(state.event_log)
-            lines.append(f"{'─' * 22}\nShowing newest → oldest")
-            await send("\n".join(lines))
+
+            header = (
+                f"📝 Event Log — {len(display)} events"
+                + (" (from disk 💾)" if source == "disk" else "")
+                + f"\n{'─' * 22}"
+            )
+            footer = (
+                f"{'─' * 22}\n"
+                f"Showing newest → oldest\n"
+                f"Full log: {_EVENT_LOG_FILE} ({_EVENT_LOG_DISK}-line rolling file)"
+            )
+            await send("\n".join([header] + display + [footer]))
 
         else:
             # Unknown text while not in wizard — silently ignore
