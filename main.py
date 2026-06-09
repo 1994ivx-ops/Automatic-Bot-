@@ -1309,6 +1309,62 @@ async def first_time_auth(cfg: dict) -> None:
     print("━" * 64)
     print()
 
+# ─── Daily stats reset ────────────────────────────────────────────────────────
+
+async def midnight_reset_loop() -> None:
+    """
+    Runs forever in the background.  At every UTC midnight it resets the
+    per-day counters (links_today, cycles_today) and sends a summary message
+    to the owner via the control bot before clearing the numbers.
+
+    Sleep is calculated precisely so the reset fires within one second of
+    00:00:00 UTC regardless of when the process started.
+    """
+    while True:
+        now = datetime.utcnow()
+        # Seconds until the next UTC midnight
+        seconds_until_midnight = (
+            (23 - now.hour) * 3600
+            + (59 - now.minute) * 60
+            + (60 - now.second)
+        )
+        log.info(
+            "Daily reset scheduled in %dh %dm %ds (UTC midnight).",
+            seconds_until_midnight // 3600,
+            (seconds_until_midnight % 3600) // 60,
+            seconds_until_midnight % 60,
+        )
+        await asyncio.sleep(seconds_until_midnight)
+
+        # Snapshot before clearing so the summary is accurate
+        links  = state.links_today
+        cycles = state.cycles_today
+
+        state.links_today   = 0
+        state.cycles_today  = 0
+        state.record_event(
+            f"🔄 Daily reset — links: {links}, cycles: {cycles} → counters cleared."
+        )
+        log.info("Daily reset complete. links_today and cycles_today reset to 0.")
+
+        # Notify the owner if the control bot is already connected
+        if _web_control_client and _web_cfg:
+            try:
+                await _web_control_client.send_message(
+                    _web_cfg["your_personal_telegram_id"],
+                    f"🌅 Daily Reset (UTC midnight)\n"
+                    f"{'─' * 22}\n"
+                    f"Yesterday's links:  {links}\n"
+                    f"Yesterday's cycles: {cycles}\n"
+                    f"Counters reset to 0 — new day started!",
+                )
+            except Exception as exc:
+                log.warning("Could not send daily-reset notification: %s", exc)
+
+        # Brief pause so we don't fire twice if we wake up a fraction early
+        await asyncio.sleep(2)
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 async def main() -> None:
@@ -1321,6 +1377,9 @@ async def main() -> None:
     # Flask runs on a daemon thread — Railway sees the port and won't kill the app
     flask_thread = threading.Thread(target=start_flask, daemon=True)
     flask_thread.start()
+
+    # Launch the daily stats reset in the background (fires every UTC midnight)
+    asyncio.ensure_future(midnight_reset_loop())
 
     # Block on the control bot (runs until process is killed or bot disconnects)
     await start_control_bot(cfg)
