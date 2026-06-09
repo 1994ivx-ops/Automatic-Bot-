@@ -783,6 +783,7 @@ def _build_kb() -> ReplyKeyboardMarkup:
 
 
 async def start_control_bot(cfg: dict) -> None:
+    global _web_control_client, _web_cfg
     owner_id = cfg["your_personal_telegram_id"]
 
     control = TelegramClient(
@@ -791,6 +792,10 @@ async def start_control_bot(cfg: dict) -> None:
         cfg["api_hash"],
     )
     await control.start(bot_token=cfg["control_bot_token"])
+
+    # Expose client + cfg to the Flask /start endpoint
+    _web_control_client = control
+    _web_cfg = cfg
 
     kb = _build_kb()
 
@@ -1113,6 +1118,85 @@ def status_webhook():
     )
 
 
+# Global reference to the main asyncio event loop, set at startup so the
+# Flask thread can safely schedule coroutines onto it.
+_main_loop: asyncio.AbstractEventLoop | None = None
+
+
+@flask_app.route("/start", methods=["POST"])
+def start_endpoint():
+    import json as _json
+
+    if state.running:
+        return flask_app.response_class(
+            response=_json.dumps({"ok": False, "message": "Already running."}),
+            status=409,
+            mimetype="application/json",
+        )
+
+    if _main_loop is None or not _main_loop.is_running():
+        return flask_app.response_class(
+            response=_json.dumps({"ok": False, "message": "Event loop not ready."}),
+            status=503,
+            mimetype="application/json",
+        )
+
+    def _launch():
+        state.running = True
+        state.paused = False
+        task = asyncio.ensure_future(
+            automation_loop(_web_control_client, _web_cfg), loop=_main_loop
+        )
+        state.loop_task = task
+
+        def _on_done(t: asyncio.Task) -> None:
+            if not t.cancelled() and t.exception():
+                log.error("automation_loop (web-start) error: %s", t.exception())
+
+        task.add_done_callback(_on_done)
+
+    _main_loop.call_soon_threadsafe(_launch)
+    return flask_app.response_class(
+        response=_json.dumps({"ok": True, "message": "Automation started."}),
+        status=200,
+        mimetype="application/json",
+    )
+
+
+@flask_app.route("/stop", methods=["POST"])
+def stop_endpoint():
+    import json as _json
+
+    if not state.running and state.loop_task is None:
+        return flask_app.response_class(
+            response=_json.dumps({"ok": False, "message": "Not currently running."}),
+            status=409,
+            mimetype="application/json",
+        )
+
+    def _halt():
+        state.paused = True
+        state.running = False
+        if state.loop_task and not state.loop_task.done():
+            state.loop_task.cancel()
+
+    if _main_loop and _main_loop.is_running():
+        _main_loop.call_soon_threadsafe(_halt)
+    else:
+        _halt()
+
+    return flask_app.response_class(
+        response=_json.dumps({"ok": True, "message": "Stop signal sent."}),
+        status=200,
+        mimetype="application/json",
+    )
+
+
+# Populated by start_control_bot() once the control client and config are live.
+_web_control_client: TelegramClient | None = None
+_web_cfg: dict | None = None
+
+
 def start_flask() -> None:
     port = int(os.environ.get("PORT", 8080))
     log.info("Flask health server listening on 0.0.0.0:%d", port)
@@ -1179,7 +1263,11 @@ async def first_time_auth(cfg: dict) -> None:
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 async def main() -> None:
+    global _main_loop
     cfg = load_config()
+
+    # Capture the running event loop so Flask threads can schedule coroutines.
+    _main_loop = asyncio.get_event_loop()
 
     # Flask runs on a daemon thread — Railway sees the port and won't kill the app
     flask_thread = threading.Thread(target=start_flask, daemon=True)
