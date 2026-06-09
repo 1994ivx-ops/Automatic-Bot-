@@ -1123,9 +1123,54 @@ def status_webhook():
 _main_loop: asyncio.AbstractEventLoop | None = None
 
 
+def _check_webhook_token() -> "flask.Response | None":
+    """
+    Validates the WEBHOOK_SECRET token on protected endpoints.
+
+    Accepted formats (either is fine):
+      • Header:  Authorization: Bearer <token>
+      • Query:   ?token=<token>
+
+    Returns None when the token is valid (caller proceeds).
+    Returns a 401/503 JSON Response when access should be denied.
+
+    If WEBHOOK_SECRET is not set the endpoint is open — log a warning so
+    the operator knows to set the variable.
+    """
+    import json as _json
+    from flask import request as _req
+
+    secret = os.environ.get("WEBHOOK_SECRET", "").strip()
+    if not secret:
+        log.warning(
+            "WEBHOOK_SECRET is not set — /start and /stop are unprotected. "
+            "Set this env var on Railway to secure your endpoints."
+        )
+        return None
+
+    # Accept token from Authorization header or ?token= query param
+    auth_header = _req.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        provided = auth_header[len("Bearer "):]
+    else:
+        provided = _req.args.get("token", "")
+
+    if not provided or provided != secret:
+        return flask_app.response_class(
+            response=_json.dumps({"ok": False, "message": "Unauthorized."}),
+            status=401,
+            mimetype="application/json",
+        )
+    return None
+
+
 @flask_app.route("/start", methods=["POST"])
 def start_endpoint():
     import json as _json
+
+    denied = _check_webhook_token()
+    if denied:
+        return denied
 
     if state.running:
         return flask_app.response_class(
@@ -1166,6 +1211,10 @@ def start_endpoint():
 @flask_app.route("/stop", methods=["POST"])
 def stop_endpoint():
     import json as _json
+
+    denied = _check_webhook_token()
+    if denied:
+        return denied
 
     if not state.running and state.loop_task is None:
         return flask_app.response_class(
