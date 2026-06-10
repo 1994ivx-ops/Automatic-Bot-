@@ -16,7 +16,7 @@ First-time auth (run locally — requires an interactive terminal):
 Normal run (Railway uses this via Procfile):
     python main.py
 """
-
+import datetime
 import asyncio
 import json
 import logging
