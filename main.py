@@ -1250,6 +1250,53 @@ def status_webhook():
     )
 
 
+@flask_app.route("/proxies", methods=["GET"])
+def proxies_get():
+    import json as _json
+
+    pool = load_proxy_pool()
+    payload = {
+        "count": len(pool),
+        "proxies": pool,
+    }
+    return flask_app.response_class(
+        response=_json.dumps(payload, ensure_ascii=False, indent=2),
+        status=200,
+        mimetype="application/json",
+    )
+
+
+@flask_app.route("/proxies", methods=["DELETE"])
+def proxies_delete():
+    import json as _json
+
+    denied = _check_webhook_token()
+    if denied:
+        return denied
+
+    with _proxies_lock:
+        try:
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=BASE_DIR, prefix=".proxies_tmp_", suffix=".txt"
+            )
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+                fh.write("")
+            shutil.move(tmp_path, PROXIES_PATH)
+            log.info("proxies.txt cleared via DELETE /proxies.")
+        except Exception as exc:
+            return flask_app.response_class(
+                response=_json.dumps({"ok": False, "message": str(exc)}),
+                status=500,
+                mimetype="application/json",
+            )
+
+    return flask_app.response_class(
+        response=_json.dumps({"ok": True, "message": "Proxy list cleared."}),
+        status=200,
+        mimetype="application/json",
+    )
+
+
 # Global reference to the main asyncio event loop, set at startup so the
 # Flask thread can safely schedule coroutines onto it.
 _main_loop: asyncio.AbstractEventLoop | None = None
