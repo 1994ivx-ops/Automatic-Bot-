@@ -1,6 +1,6 @@
-telethon
-python-socks
-PySocks
-playwright
-requests
-flask
+telethon>=1.36,<2
+python-socks>=2.4,<3
+PySocks>=1.7,<2
+playwright>=1.44,<2
+requests>=2.31,<3
+flask>=3.0,<4

@@ -1048,12 +1048,15 @@ async def automation_loop(control_client: TelegramClient, cfg: dict) -> None:
                 f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             )
 
-            # ── 3. Hit the 3 master earning URLs ─────────────────────────
+            # ── 3. Hit master earning URLs ────────────────────────────────
+            # Load dynamically each cycle so control-bot edits take effect
+            # without a restart.
+            cycle_urls = load_master_urls()
             session = requests.Session()
             results: list[str] = []
 
             try:
-                for idx, url in enumerate(MASTER_URLS, start=1):
+                for idx, url in enumerate(cycle_urls, start=1):
                     if not state.running:
                         break
 
@@ -1071,7 +1074,7 @@ async def automation_loop(control_client: TelegramClient, cfg: dict) -> None:
                     results.append(f"{status} Link {idx}: {short}")
 
                     # Micro human-like delay between requests (not after the last one)
-                    if idx < len(MASTER_URLS) and state.running:
+                    if idx < len(cycle_urls) and state.running:
                         await asyncio.sleep(random.uniform(1.0, 3.0))
 
             finally:
