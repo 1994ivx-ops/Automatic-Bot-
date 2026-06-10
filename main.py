@@ -241,17 +241,18 @@ def build_playwright_proxy(cfg: dict, suffix: str) -> dict:
     }
 
 
-async def get_current_ip_async(cfg: dict, suffix: str) -> str:
+async def get_current_ip_async(requests_proxy: dict) -> str:
     """
-    Non-blocking IP lookup through the session proxy.
+    Non-blocking IP lookup through the given requests-style proxy dict.
     Runs the blocking `requests.get` in a thread pool so it never stalls
     the asyncio event loop.
     """
     def _fetch():
         try:
-            proxies = build_requests_proxy(cfg, suffix)
             r = requests.get(
-                "https://api.ipify.org?format=json", proxies=proxies, timeout=15
+                "https://api.ipify.org?format=json",
+                proxies=requests_proxy,
+                timeout=15,
             )
             return r.json().get("ip", "unknown")
         except Exception as exc:
@@ -259,6 +260,123 @@ async def get_current_ip_async(cfg: dict, suffix: str) -> str:
             return "unavailable"
 
     return await asyncio.to_thread(_fetch)
+
+
+# ─── Proxy pool helpers ────────────────────────────────────────────────────────
+
+def load_proxy_pool() -> list[str]:
+    """Read proxies.txt and return non-empty, non-comment lines."""
+    with _proxies_lock:
+        try:
+            with open(PROXIES_PATH, "r", encoding="utf-8") as fh:
+                return [
+                    ln.strip()
+                    for ln in fh
+                    if ln.strip() and not ln.strip().startswith("#")
+                ]
+        except FileNotFoundError:
+            return []
+
+
+def parse_proxy_url(url: str) -> dict | None:
+    """
+    Parse a full proxy URL into a normalised component dict.
+
+    Supports:
+      http://1.2.3.4:8080
+      socks5://user:pass@1.2.3.4:1080
+      socks4://host:port
+    Returns None if the URL cannot be parsed or the port is invalid.
+    """
+    try:
+        p = urlparse(url)
+        proto = (p.scheme or "http").lower()
+        if proto not in ("http", "https", "socks4", "socks5"):
+            proto = "http"
+        port = p.port
+        if not port or not (1 <= port <= 65535):
+            return None
+        return {
+            "proxy_type": proto,
+            "host":       p.hostname or "",
+            "port":       port,
+            "username":   p.username or "",
+            "password":   p.password or "",
+        }
+    except Exception:
+        return None
+
+
+def _pool_telethon(p: dict) -> dict:
+    """Build a Telethon proxy dict from a parsed pool entry."""
+    d: dict = {
+        "proxy_type": p["proxy_type"],
+        "addr":       p["host"],
+        "port":       p["port"],
+        "rdns":       True,
+    }
+    if p["username"]:
+        d["username"] = p["username"]
+        d["password"] = p["password"]
+    return d
+
+
+def _pool_requests(p: dict) -> dict:
+    """Build a requests proxy dict from a parsed pool entry."""
+    scheme = "socks5h" if p["proxy_type"] == "socks5" else p["proxy_type"]
+    if p["username"]:
+        url = f"{scheme}://{p['username']}:{p['password']}@{p['host']}:{p['port']}"
+    else:
+        url = f"{scheme}://{p['host']}:{p['port']}"
+    return {"http": url, "https": url}
+
+
+def _pool_playwright(p: dict) -> dict:
+    """Build a Playwright proxy dict from a parsed pool entry."""
+    d: dict = {"server": f"{p['proxy_type']}://{p['host']}:{p['port']}"}
+    if p["username"]:
+        d["username"] = p["username"]
+        d["password"] = p["password"]
+    return d
+
+
+def resolve_cycle_proxies(cfg: dict, suffix: str) -> tuple[dict, dict, dict, str]:
+    """
+    Select the proxy set for one automation cycle.
+
+    Priority
+    --------
+    1. proxies.txt pool  — if the file has entries, one is picked at random.
+    2. Asocks fallback   — uses PROXY_* env-var credentials + session suffix.
+
+    Returns
+    -------
+    (telethon_proxy, requests_proxy, playwright_proxy, label)
+
+    ``label`` is logged at cycle start so you can see which proxy was chosen.
+    """
+    pool = load_proxy_pool()
+    if pool:
+        url = random.choice(pool)
+        parsed = parse_proxy_url(url)
+        if parsed:
+            log.info("Proxy pool selected: %s", url)
+            return (
+                _pool_telethon(parsed),
+                _pool_requests(parsed),
+                _pool_playwright(parsed),
+                f"pool → {url}",
+            )
+        log.warning("Could not parse pool entry '%s' — falling back to Asocks.", url)
+
+    # Asocks fallback
+    log.info("No valid pool proxy — using Asocks session%s.", suffix)
+    return (
+        build_telethon_proxy(cfg, suffix),
+        build_requests_proxy(cfg, suffix),
+        build_playwright_proxy(cfg, suffix),
+        f"asocks{suffix}",
+    )
 
 # ─── Referral / affiliate URL injection ──────────────────────────────────────
 
@@ -533,16 +651,20 @@ async def playwright_visit(url: str, playwright_proxy: dict) -> bool:
 
 # ─── Userbot cycle (single pass over all tasks) ───────────────────────────────
 
-async def run_userbot_cycle(cfg: dict, suffix: str, notify) -> None:
+async def run_userbot_cycle(
+    cfg: dict,
+    telethon_proxy: dict,
+    playwright_proxy: dict,
+    notify,
+) -> None:
     """
-    Connects the Telethon userbot via a fresh Asocks session (new IP per cycle),
-    iterates every task in targets.json sequentially, clicks matching buttons,
-    injects referral tokens, and launches the Playwright visit for each URL.
-    Fully disconnects Telethon and closes the browser on exit — no sockets
-    remain open during the inter-cycle sleep, forcing a cold-boot next turn.
+    Connects the Telethon userbot via the pre-resolved proxy (pool entry or
+    Asocks fallback), iterates every task in targets.json sequentially, clicks
+    matching buttons, injects referral tokens, and launches the Playwright
+    visit for each URL.  Fully disconnects on exit — no sockets remain open
+    during the inter-cycle sleep, forcing a cold-boot next turn.
     """
-    proxy = build_telethon_proxy(cfg, suffix)
-    playwright_proxy = build_playwright_proxy(cfg, suffix)
+    proxy = telethon_proxy
 
     client = TelegramClient(
         _get_userbot_session(),
@@ -722,22 +844,24 @@ async def automation_loop(control_client: TelegramClient, cfg: dict) -> None:
     try:
         while state.running and not state.paused:
             # One suffix per cycle → one brand-new Asocks IP for all work in
-            # this window.  Generated fresh here so Telethon, Playwright, and
-            # the IP-check all share the exact same session token.
+            # Resolve proxy for this cycle: pool entry (random) → Asocks fallback.
+            # One suffix per cycle so all connections share the same Asocks session.
             suffix = fresh_session_suffix()
-            log.info("New session suffix: %s", suffix)
+            t_proxy, r_proxy, pw_proxy, proxy_label = resolve_cycle_proxies(cfg, suffix)
+            log.info("Proxy resolved: %s", proxy_label)
 
-            # IP lookup is blocking — run in thread pool
-            state.active_ip = await get_current_ip_async(cfg, suffix)
+            # IP lookup — run in thread pool so the event loop isn't blocked
+            state.active_ip = await get_current_ip_async(r_proxy)
 
-            log.info("═══ Cycle start | IP: %s ═══", state.active_ip)
+            log.info("═══ Cycle start | IP: %s | Proxy: %s ═══", state.active_ip, proxy_label)
             await notify(
                 f"🔄 Cycle #{state.cycles_today + 1} starting\n"
                 f"🌐 IP: {state.active_ip}\n"
+                f"🔀 Proxy: {proxy_label}\n"
                 f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             )
 
-            await run_userbot_cycle(cfg, suffix, notify)
+            await run_userbot_cycle(cfg, t_proxy, pw_proxy, notify)
 
             if not state.running or state.paused:
                 break
@@ -963,9 +1087,11 @@ async def start_control_bot(cfg: dict) -> None:
 
         elif text == "🌐 فحص الـ IP الحالي":
             await send("🔍 Checking IP via session proxy…")
-            ip = await get_current_ip_async(cfg, fresh_session_suffix())
+            suffix = fresh_session_suffix()
+            _, r_proxy, _, proxy_label = resolve_cycle_proxies(cfg, suffix)
+            ip = await get_current_ip_async(r_proxy)
             state.active_ip = ip
-            await send(f"🌐 Current IP: {ip}")
+            await send(f"🌐 Current IP: {ip}\n🔀 Proxy: {proxy_label}")
 
         elif text == "➕ إضافة رابط/بوت جديد":
             state.conv_step[owner_id] = {"step": "ask_username"}
