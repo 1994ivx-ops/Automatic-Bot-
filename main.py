@@ -568,7 +568,7 @@ _EVENT_LOG_DISK  = 500  # max lines kept on disk before rotation
 
 class BotState:
     def __init__(self):
-        self._last_reset_date = datetime.datetime.now().date()
+        self._last_reset_date = datetime.now().date()
         self.running: bool = False
         self.paused: bool = False
         self.active_ip: str = "—"
