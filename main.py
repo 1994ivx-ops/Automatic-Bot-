@@ -67,6 +67,24 @@ _targets_lock = threading.Lock()
 # reads the proxy list so concurrent writes are safe.
 _proxies_lock = threading.Lock()
 
+# ─── Master earning URLs (fixed cycle targets) ────────────────────────────────
+# These three URLs are hit on every automation cycle instead of (or in
+# addition to) Telegram channel button scanning.  Edit here to add / change.
+
+MASTER_URLS: list[str] = [
+    "https://www.effectivecpmnetwork.com/rxq4tac0?key=bbe818c4c2fe1f47f526cb5f7229e6ea",
+    "https://omg10.com/4/11053040",
+    "https://omg10.com/4/11018852",
+]
+
+# ─── Per-session used-IP registry ─────────────────────────────────────────────
+# All IPs that produced successful hits in this runtime session.  Checked
+# before every cycle — if the verified IP is already in this set the proxy
+# is discarded and a fresh one is tried instead.
+
+_used_ips: set[str] = set()
+_used_ips_lock = threading.Lock()
+
 # ─── Config / Targets helpers ─────────────────────────────────────────────────
 
 def load_config() -> dict:
@@ -377,6 +395,84 @@ def resolve_cycle_proxies(cfg: dict, suffix: str) -> tuple[dict, dict, dict, str
         build_playwright_proxy(cfg, suffix),
         f"asocks{suffix}",
     )
+
+# ─── Pre-flight proxy validator ──────────────────────────────────────────────
+
+async def acquire_fresh_proxy(cfg: dict) -> tuple[dict, str]:
+    """
+    Tight validation loop — keeps pulling random proxies and testing them
+    against ipify until one:
+      (a) returns a valid public IP within 4 seconds, AND
+      (b) has NOT been used in this runtime session.
+
+    Strategy
+    --------
+    • Load the pool from proxies.txt.  If the pool is empty use Asocks
+      with a fresh session suffix each attempt.
+    • Shuffle a working copy of the pool so we don't hammer the same entry.
+    • After exhausting every pool entry without a unique IP, fall back to
+      Asocks for the remaining attempts (max 20 total attempts per call).
+    • On success, register the IP in _used_ips and return
+      (requests_proxy_dict, verified_ip).
+    """
+    MAX_ATTEMPTS = 20
+    pool = load_proxy_pool()
+    random.shuffle(pool)
+    # Iterator: pool entries first, then unlimited Asocks fallbacks
+    attempt = 0
+
+    def _get_candidate(idx: int) -> tuple[dict, str]:
+        """Return (requests_proxy, label) for attempt #idx."""
+        if idx < len(pool):
+            url = pool[idx]
+            parsed = parse_proxy_url(url)
+            if parsed:
+                return _pool_requests(parsed), f"pool→{url}"
+        # Asocks fallback
+        suffix = fresh_session_suffix()
+        return build_requests_proxy(cfg, suffix), f"asocks{suffix}"
+
+    def _test_proxy(requests_proxy: dict) -> str | None:
+        """Synchronous: test proxy via ipify (4 s timeout). Returns IP or None."""
+        try:
+            r = requests.get(
+                "https://api.ipify.org?format=json",
+                proxies=requests_proxy,
+                timeout=4,
+            )
+            ip = r.json().get("ip", "").strip()
+            return ip if ip else None
+        except Exception:
+            return None
+
+    while attempt < MAX_ATTEMPTS:
+        r_proxy, label = _get_candidate(attempt)
+        attempt += 1
+        log.info("Proxy validation attempt %d: %s", attempt, label)
+
+        ip = await asyncio.to_thread(_test_proxy, r_proxy)
+
+        if not ip or ip == "unavailable":
+            log.warning("  ✗ Proxy failed or timed out — discarding.")
+            continue
+
+        with _used_ips_lock:
+            if ip in _used_ips:
+                log.warning("  ✗ IP %s already used this session — discarding.", ip)
+                # Force Asocks on the next attempt even if pool isn't exhausted
+                attempt = max(attempt, len(pool))
+                continue
+            # ✓ Fresh, validated IP — register it
+            _used_ips.add(ip)
+
+        log.info("  ✓ Proxy validated | IP: %s | via %s", ip, label)
+        return r_proxy, ip
+
+    # Should never reach here in normal operation
+    raise RuntimeError(
+        f"Could not acquire a fresh, unique proxy after {MAX_ATTEMPTS} attempts."
+    )
+
 
 # ─── Referral / affiliate URL injection ──────────────────────────────────────
 
@@ -830,52 +926,135 @@ async def run_userbot_cycle(
 
 async def automation_loop(control_client: TelegramClient, cfg: dict) -> None:
     """
-    Master loop: runs userbot cycles every 27–33 minutes until stopped.
+    High-speed earning loop.
+
+    Each cycle:
+      1. Pre-flight proxy validation — acquires a fresh, unique, live IP.
+      2. Sequential HTTP GET to each of the 3 MASTER_URLS (1–3 s micro-delay).
+      3. Fully closes the requests session (releases the proxy socket).
+      4. Sleeps a random 5–10 minutes before the next cycle.
+
+    The Telegram userbot channel scanner (run_userbot_cycle) is paused in
+    this mode — it remains available in the codebase but is not called here.
     """
     owner_id = cfg["your_personal_telegram_id"]
 
     async def notify(text: str) -> None:
-        state.record_event(text)          # always log, even if Telegram send fails
+        state.record_event(text)
         try:
             await control_client.send_message(owner_id, text)
         except Exception as ne:
             log.warning("Notification send failed: %s", ne)
 
+    def _hit_url(url: str, proxies: dict, session: requests.Session) -> bool:
+        """Synchronous GET — returns True on HTTP 2xx/3xx."""
+        try:
+            resp = session.get(
+                url,
+                proxies=proxies,
+                timeout=20,
+                allow_redirects=True,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/125.0.0.0 Safari/537.36"
+                    ),
+                    "Accept": (
+                        "text/html,application/xhtml+xml,application/xml;"
+                        "q=0.9,image/webp,*/*;q=0.8"
+                    ),
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Referer": "https://www.google.com/",
+                },
+            )
+            return resp.status_code < 400
+        except Exception as exc:
+            log.warning("  GET failed (%s): %s", url, exc)
+            return False
+
     try:
         while state.running and not state.paused:
-            # One suffix per cycle → one brand-new Asocks IP for all work in
-            # Resolve proxy for this cycle: pool entry (random) → Asocks fallback.
-            # One suffix per cycle so all connections share the same Asocks session.
-            suffix = fresh_session_suffix()
-            t_proxy, r_proxy, pw_proxy, proxy_label = resolve_cycle_proxies(cfg, suffix)
-            log.info("Proxy resolved: %s", proxy_label)
 
-            # IP lookup — run in thread pool so the event loop isn't blocked
-            state.active_ip = await get_current_ip_async(r_proxy)
+            # ── 1. Daily counter reset ─────────────────────────────────────
+            now_utc = datetime.utcnow()
+            if now_utc.date() > state._last_reset_date:
+                state.links_today  = 0
+                state.cycles_today = 0
+                state._last_reset_date = now_utc.date()
+                log.info("Daily counters reset at UTC midnight.")
 
-            log.info("═══ Cycle start | IP: %s | Proxy: %s ═══", state.active_ip, proxy_label)
+            cycle_num = state.cycles_today + 1
+            log.info("═══ Cycle #%d — acquiring fresh proxy ═══", cycle_num)
+
+            # ── 2. Pre-flight proxy validation ────────────────────────────
+            try:
+                r_proxy, verified_ip = await acquire_fresh_proxy(cfg)
+            except RuntimeError as err:
+                log.error("acquire_fresh_proxy failed: %s", err)
+                await notify(f"⚠️ Could not get a valid proxy — retrying in 60 s.\n{err}")
+                await asyncio.sleep(60)
+                continue
+
+            state.active_ip = verified_ip
             await notify(
-                f"🔄 Cycle #{state.cycles_today + 1} starting\n"
-                f"🌐 IP: {state.active_ip}\n"
-                f"🔀 Proxy: {proxy_label}\n"
+                f"🔄 Cycle #{cycle_num} starting\n"
+                f"🌐 Verified IP: {verified_ip}\n"
                 f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             )
 
-            await run_userbot_cycle(cfg, t_proxy, pw_proxy, notify)
+            # ── 3. Hit the 3 master earning URLs ─────────────────────────
+            session = requests.Session()
+            results: list[str] = []
+
+            try:
+                for idx, url in enumerate(MASTER_URLS, start=1):
+                    if not state.running:
+                        break
+
+                    ok = await asyncio.to_thread(_hit_url, url, r_proxy, session)
+                    status = "✅" if ok else "⚠️"
+                    short = url[:72] + ("…" if len(url) > 72 else "")
+
+                    if ok:
+                        state.total_clicks += 1
+                        state.links_today  += 1
+                        log.info("  ✅ Hit Link %d via IP %s → %s", idx, verified_ip, url)
+                    else:
+                        log.warning("  ⚠️ Link %d returned error → %s", idx, url)
+
+                    results.append(f"{status} Link {idx}: {short}")
+
+                    # Micro human-like delay between requests (not after the last one)
+                    if idx < len(MASTER_URLS) and state.running:
+                        await asyncio.sleep(random.uniform(1.0, 3.0))
+
+            finally:
+                session.close()   # release proxy socket immediately
+
+            # ── 4. Cycle summary notification ────────────────────────────
+            state.cycles_today += 1
+            result_block = "\n".join(results)
+            await notify(
+                f"✅ Cycle #{cycle_num} complete\n"
+                f"🌐 IP used: {verified_ip}\n"
+                f"{result_block}\n"
+                f"Links today: {state.links_today} | "
+                f"Total clicks: {state.total_clicks}"
+            )
 
             if not state.running or state.paused:
                 break
 
-            sleep_min = random.uniform(27, 33)
-            sleep_sec = sleep_min * 60
+            # ── 5. Sleep 5–10 minutes (interruptible) ────────────────────
+            sleep_sec = random.uniform(300, 600)
+            sleep_min = sleep_sec / 60
             log.info("Sleeping %.1f minutes before next cycle.", sleep_min)
             await notify(
-                f"💤 Cycle complete. Next cycle in {sleep_min:.1f} minutes.\n"
-                f"Clicks this session: {state.total_clicks} | "
-                f"Links today: {state.links_today}"
+                f"💤 Next cycle in {sleep_min:.1f} min "
+                f"({int(sleep_sec)} s)"
             )
 
-            # Sleep in 5-second slices so stop/pause takes effect promptly
             elapsed = 0.0
             while elapsed < sleep_sec:
                 if not state.running or state.paused:
