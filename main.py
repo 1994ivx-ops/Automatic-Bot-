@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import random
+import re
 import threading
 import tempfile
 import shutil
@@ -54,12 +55,17 @@ log = logging.getLogger(__name__)
 # ─── Paths ────────────────────────────────────────────────────────────────────
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
-TARGETS_PATH = os.path.join(BASE_DIR, "targets.json")
+CONFIG_PATH   = os.path.join(BASE_DIR, "config.json")
+TARGETS_PATH  = os.path.join(BASE_DIR, "targets.json")
+PROXIES_PATH  = os.path.join(BASE_DIR, "proxies.txt")
 
 # File-level lock — guards all reads AND writes to targets.json so that a
 # concurrent control-bot write never races with the userbot's load.
 _targets_lock = threading.Lock()
+
+# Lock for proxies.txt — shared between the listener and anything else that
+# reads the proxy list so concurrent writes are safe.
+_proxies_lock = threading.Lock()
 
 # ─── Config / Targets helpers ─────────────────────────────────────────────────
 
@@ -1309,6 +1315,148 @@ async def first_time_auth(cfg: dict) -> None:
     print("━" * 64)
     print()
 
+# ─── Saved Messages proxy listener ───────────────────────────────────────────
+
+_PROXY_LINE_RE = re.compile(
+    r"""
+    (?:(?P<proto>https?|socks[45])://)?   # optional protocol prefix
+    (?P<host>
+        (?:\d{1,3}\.){3}\d{1,3}          # IPv4
+        |localhost
+        |(?:[a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,}  # hostname
+    )
+    :(?P<port>\d{2,5})                    # :PORT
+    """,
+    re.VERBOSE,
+)
+
+
+def _parse_proxy_lines(text: str) -> list[str]:
+    """
+    Extract and normalise proxy entries from a block of text.
+
+    Rules:
+    • Each line is evaluated independently.
+    • Lines already containing a recognised protocol are kept verbatim
+      (stripped).
+    • Lines that match bare  HOST:PORT  are prefixed with  http://
+    • Any line that does not match the pattern is silently skipped.
+    • Port must be 1–65535; entries outside that range are dropped.
+    """
+    results = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _PROXY_LINE_RE.search(line)
+        if not m:
+            continue
+        port = int(m.group("port"))
+        if not (1 <= port <= 65535):
+            continue
+        proto = (m.group("proto") or "http").lower()
+        host  = m.group("host")
+        results.append(f"{proto}://{host}:{port}")
+    return results
+
+
+def _append_unique_proxies(new_proxies: list[str]) -> int:
+    """
+    Thread-safe append of new_proxies to proxies.txt.
+    Reads existing entries, merges, deduplicates (order-preserving),
+    writes back atomically.  Returns the count of genuinely new entries added.
+    """
+    with _proxies_lock:
+        # Read existing
+        existing: list[str] = []
+        try:
+            with open(PROXIES_PATH, "r", encoding="utf-8") as fh:
+                existing = [ln.strip() for ln in fh if ln.strip()]
+        except FileNotFoundError:
+            pass
+
+        existing_set = set(existing)
+        added = [p for p in new_proxies if p not in existing_set]
+        if not added:
+            return 0
+
+        merged = existing + added
+        # Atomic write
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=BASE_DIR, prefix=".proxies_tmp_", suffix=".txt"
+        )
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(merged) + "\n")
+            shutil.move(tmp_path, PROXIES_PATH)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        return len(added)
+
+
+async def start_proxy_listener(cfg: dict) -> None:
+    """
+    Persistent userbot client that watches the owner's Saved Messages for
+    proxy blocks.
+
+    When you send yourself a message containing one or more  IP:PORT  lines
+    (or fully-qualified  protocol://host:port  entries), this listener:
+      1. Parses every valid proxy line in the message.
+      2. Appends only new (non-duplicate) entries to  proxies.txt.
+      3. Replies to Saved Messages with a live confirmation.
+
+    The client runs independently of the 30-minute click loop — it never
+    disconnects unless the process exits.
+    """
+    listener = TelegramClient(
+        _get_userbot_session(),
+        cfg["api_id"],
+        cfg["api_hash"],
+        proxy=build_telethon_proxy(cfg, fresh_session_suffix()),
+    )
+    await listener.connect()
+
+    if not await listener.is_user_authorized():
+        log.error(
+            "Proxy listener: userbot not authorised — set SESSION_STRING. "
+            "Listener will not start."
+        )
+        await listener.disconnect()
+        return
+
+    @listener.on(events.NewMessage(from_users="me", incoming=False, outgoing=True))
+    async def _on_saved_message(event):
+        """Fires whenever the owner sends a message to their Saved Messages."""
+        text = event.raw_text or ""
+        parsed = _parse_proxy_lines(text)
+        if not parsed:
+            return  # Not a proxy block — ignore silently
+
+        try:
+            added = _append_unique_proxies(parsed)
+        except Exception as exc:
+            log.error("proxies.txt write error: %s", exc)
+            await event.reply(f"❌ Error saving proxies: {exc}")
+            return
+
+        total = len(parsed)
+        duplicates = total - added
+        msg = (
+            f"✅ Successfully parsed and saved {added} new unique "
+            f"{'proxy' if added == 1 else 'proxies'} to the file!\n"
+            f"📋 Total parsed: {total} | Duplicates skipped: {duplicates}"
+        )
+        log.info("Proxy listener: %s", msg)
+        await event.reply(msg)
+
+    log.info("Proxy listener active — watching Saved Messages for proxy blocks.")
+    await listener.run_until_disconnected()
+
+
 # ─── Daily stats reset ────────────────────────────────────────────────────────
 
 async def midnight_reset_loop() -> None:
@@ -1380,6 +1528,9 @@ async def main() -> None:
 
     # Launch the daily stats reset in the background (fires every UTC midnight)
     asyncio.ensure_future(midnight_reset_loop())
+
+    # Launch the Saved Messages proxy listener in the background (non-blocking)
+    asyncio.ensure_future(start_proxy_listener(cfg))
 
     # Block on the control bot (runs until process is killed or bot disconnects)
     await start_control_bot(cfg)
