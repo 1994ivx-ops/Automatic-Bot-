@@ -1476,6 +1476,30 @@ def proxies_delete():
     )
 
 
+@flask_app.route("/reset-ips", methods=["DELETE"])
+def reset_ips():
+    import json as _json
+
+    denied = _check_webhook_token()
+    if denied:
+        return denied
+
+    with _used_ips_lock:
+        count = len(_used_ips)
+        _used_ips.clear()
+
+    log.info("Used-IP registry cleared via DELETE /reset-ips (%d IPs removed).", count)
+    return flask_app.response_class(
+        response=_json.dumps({
+            "ok": True,
+            "message": f"Used-IP registry cleared. {count} IP(s) removed.",
+            "cleared_count": count,
+        }),
+        status=200,
+        mimetype="application/json",
+    )
+
+
 # Global reference to the main asyncio event loop, set at startup so the
 # Flask thread can safely schedule coroutines onto it.
 _main_loop: asyncio.AbstractEventLoop | None = None
