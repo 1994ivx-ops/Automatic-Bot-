@@ -67,6 +67,9 @@ _targets_lock = threading.Lock()
 # reads the proxy list so concurrent writes are safe.
 _proxies_lock = threading.Lock()
 
+# Lock for master_urls.json — guards control-bot writes vs. cycle reads.
+_master_urls_lock = threading.Lock()
+
 # ─── Master earning URLs (fixed cycle targets) ────────────────────────────────
 # These three URLs are hit on every automation cycle instead of (or in
 # addition to) Telegram channel button scanning.  Edit here to add / change.
@@ -192,6 +195,48 @@ def save_targets(data: dict) -> None:
             except OSError:
                 pass
             raise
+
+# ─── Master-URL helpers ───────────────────────────────────────────────────────
+
+MASTER_URLS_PATH = os.path.join(BASE_DIR, "master_urls.json")
+
+
+def load_master_urls() -> list[str]:
+    """
+    Load the active earning URL list from master_urls.json.
+    Falls back to the hardcoded MASTER_URLS constant if the file is absent,
+    empty, or malformed — so the bot always has something to hit.
+    """
+    with _master_urls_lock:
+        try:
+            with open(MASTER_URLS_PATH, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            urls = [u.strip() for u in data.get("urls", []) if u.strip()]
+            return urls if urls else list(MASTER_URLS)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return list(MASTER_URLS)
+
+
+def save_master_urls(urls: list[str]) -> None:
+    """
+    Thread-safe atomic write to master_urls.json.
+    Uses a temp-file-then-rename strategy to prevent partial-write corruption.
+    """
+    with _master_urls_lock:
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=BASE_DIR, prefix=".master_urls_tmp_", suffix=".json"
+        )
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+                json.dump({"urls": urls}, fh, indent=2, ensure_ascii=False)
+            shutil.move(tmp_path, MASTER_URLS_PATH)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
 
 # ─── Proxy helpers ────────────────────────────────────────────────────────────
 
@@ -1077,9 +1122,10 @@ async def automation_loop(control_client: TelegramClient, cfg: dict) -> None:
 _KEYBOARD_ROWS = [
     ["🚀 تشغيل السكربت", "🛑 إيقاف مؤقت"],
     ["📊 تقرير الدورة الحالية", "🌐 فحص الـ IP الحالي"],
+    ["🔗 عرض روابط الكسب", "➕ إضافة رابط كسب"],
+    ["🗑️ حذف رابط كسب", "📅 إعادة تعيين الإحصائيات"],
     ["➕ إضافة رابط/بوت جديد", "📋 عرض المهام"],
-    ["🗑️ حذف مهمة", "📅 إعادة تعيين الإحصائيات"],
-    ["📝 سجل الأحداث"],
+    ["🗑️ حذف مهمة", "📝 سجل الأحداث"],
 ]
 
 
@@ -1210,6 +1256,64 @@ async def start_control_bot(cfg: dict) -> None:
                 )
                 return
 
+            if step == "ask_add_url":
+                url = text.strip()
+                if text.lower() in ("cancel", "إلغاء"):
+                    del state.conv_step[owner_id]
+                    await send("↩️ Cancelled. No URL added.")
+                    return
+                if not url.startswith(("http://", "https://")):
+                    await event.reply(
+                        "⚠️ URL must start with http:// or https://\n"
+                        "Try again or type `cancel` to abort:"
+                    )
+                    return
+                current = load_master_urls()
+                if url in current:
+                    del state.conv_step[owner_id]
+                    await send("⚠️ That URL is already in the list. No change made.")
+                    return
+                current.append(url)
+                save_master_urls(current)
+                del state.conv_step[owner_id]
+                await send(
+                    f"✅ URL added!\n"
+                    f"  {url}\n\n"
+                    f"Active earning URLs: {len(current)}"
+                )
+                return
+
+            if step == "ask_remove_url_number":
+                current = load_master_urls()
+                total = len(current)
+                if text.lower() in ("cancel", "إلغاء", "0"):
+                    del state.conv_step[owner_id]
+                    await send("↩️ Cancelled. No URL removed.")
+                    return
+                try:
+                    idx = int(text)
+                except ValueError:
+                    await event.reply(
+                        f"⚠️ Please send a number between 1 and {total}, "
+                        "or type `cancel` to abort:"
+                    )
+                    return
+                if idx < 1 or idx > total:
+                    await event.reply(
+                        f"⚠️ Number out of range (1–{total}). "
+                        "Try again or type `cancel`:"
+                    )
+                    return
+                removed_url = current.pop(idx - 1)
+                save_master_urls(current)
+                del state.conv_step[owner_id]
+                await send(
+                    f"🗑️ URL #{idx} removed!\n"
+                    f"  {removed_url}\n\n"
+                    f"Remaining earning URLs: {len(current)}"
+                )
+                return
+
         # ── Command dispatch ──────────────────────────────────────────────
 
         if text in ("/start", "/help"):
@@ -1271,6 +1375,36 @@ async def start_control_bot(cfg: dict) -> None:
             ip = await get_current_ip_async(r_proxy)
             state.active_ip = ip
             await send(f"🌐 Current IP: {ip}\n🔀 Proxy: {proxy_label}")
+
+        elif text == "🔗 عرض روابط الكسب":
+            urls = load_master_urls()
+            source = "master_urls.json" if not urls == list(MASTER_URLS) else "hardcoded defaults"
+            lines = [f"🔗 Active Earning URLs ({len(urls)} total)\n{'─' * 28}"]
+            for i, u in enumerate(urls, start=1):
+                lines.append(f"\n#{i}  {u}")
+            lines.append(f"\n{'─' * 28}\nSource: {source}")
+            await send("\n".join(lines))
+
+        elif text == "➕ إضافة رابط كسب":
+            state.conv_step[owner_id] = {"step": "ask_add_url"}
+            await event.reply(
+                "➕ Add Earning URL\n\n"
+                "Send the full URL to add (must start with http:// or https://):\n"
+                "Or type `cancel` to abort."
+            )
+
+        elif text == "🗑️ حذف رابط كسب":
+            urls = load_master_urls()
+            if not urls:
+                await send("📋 No earning URLs configured.")
+                return
+            lines = [f"🗑️ Remove Earning URL\n{'─' * 28}\nWhich URL do you want to remove?\n"]
+            for i, u in enumerate(urls, start=1):
+                short = u[:70] + ("…" if len(u) > 70 else "")
+                lines.append(f"  #{i} — {short}")
+            lines.append(f"\n{'─' * 28}\nSend the number (1–{len(urls)})\nor type `cancel` to abort.")
+            state.conv_step[owner_id] = {"step": "ask_remove_url_number"}
+            await event.reply("\n".join(lines))
 
         elif text == "➕ إضافة رابط/بوت جديد":
             state.conv_step[owner_id] = {"step": "ask_username"}
